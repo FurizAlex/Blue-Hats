@@ -1,5 +1,8 @@
 #include "blueHats.h"
 
+#define GITHUB_USER "User"
+#define GITHUB_REPO = "bluehats-registry"
+
 void packTarball(const char* sourceDir, const char* outPath) {
 	struct archive* a = archive_write_new();
 	archive_write_add_filter_gzip(a);
@@ -95,25 +98,152 @@ void parsePackageInfo(const char* path, char* name, char* version) {
 	fclose(f);
 }
 
-char *sha256_file(const char* path) {
-	FILE* f = fopen(path, "rb");
-	unsigned char buffer[4096];
-	SHA256_CTX ctx;
-	SHA256_Init(&ctx);
-	size_t num;
+char *createRelease(const char* name, const char* version, const char* token) {
+	CURL* curl = curl_easy_init();
+	Buffer response = {malloc(1), 0};
 
-	while ((num = fread(buffer, 1, sizeof(buffer), f)) > 0)
-		SHA256_Update(&ctx, buffer, num);
+	char URL[256];
+	snprintf(URL, sizeof(URL)),
+		"https://api.github.com/repos/%s/%s/release", GITHUB_USER, GITHUB_REPO;
+	
+	char body[256];
+	snprintf(body, sizeof(body), "{\"tag_name\":\"%s-%s\",\"name\":\"%s %s\}", name, version, name, version);
+
+	char auth[256];
+	snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
+
+	struct curl_slist* headers = NULL;
+	headers = curl_slist_append(headers, auth);
+	headers = curl_slist_append(headers, "Content-Type: applications/json");
+	headers = curl_slist_append(headers, "User-Agent: bluehats");
+
+	curl_easy_setopt(curl, CURLOPT_URL, URL);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+	curl_easy_perform(curl);
+	curl_easy_cleanup(curl);
+	curl_slist_free_all(headers);
+
+	char* key = strstr(response.data, "\"upload_url\"");
+	char* start = strchr(key, '"') + 1;
+
+	start = strchr(start, '"') + 1;
+
+	char* end = strchr(start, '{');
+	end--;
+
+	int len = end - start;
+	char* uploadURL = malloc(len + 1);
+
+	strncpy(uploadURL, start, len);
+	uploadURL[len] = '\0';
+
+	free(response.data);
+	return uploadURL;
+}
+
+void uploadAsset(const char* uploadURL, const char *tarballPath, const char* name, const char* version, const char* token) {
+	CURL* curl = curl_easy_init();
+	Buffer response = {malloc(1), 0};
+
+	char URL[512];
+	snprintf(URL, sizeof(URL), "%s?name=%s-%s.tar.gz", uploadURL, name, version);
+
+	struct curl_slist* headers = NULL;
+	headers = curl_slist_append(headers, auth);
+	headers = curl_slist_append(headers, "Content-Type: applications/json");
+	headers = curl_slist_append(headers, "User-Agent: bluehats");
+
+	FILE* f = fopen(tarballPath, "rb");
+	fseek(f, 0, SEEK_END);
+
+	long size = ftell(f);
+	rewind(f);
+
+	char* data = malloc(size);
+	fread(data, 1, size, f);
 	fclose(f);
 
-	unsigned char hash[32];
-	SHA256_Final(hash, &ctx);
+	curl_easy_setopt(curl, CURLOPT_URL, URL);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+	curl_easy_perform(curl);
 
-	char* hex = malloc(65);
-	for (int i = 0; i < 32; i++)
-		sprintf(hex + i * 2, "%02x", hash[i]);
-	hex[64] = '\0';
-	return hex;
+	free(data);
+	free(response.data);
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+}
+
+void updateIndex(const char* name, const char* version, const char* token) {
+	char URL[256];
+	snprintf(URL, sizeof(URL), "https://api.github.com/repos/%s/%s/contents/index.json", GITHUB_USER, GITHUB_REPO);
+	
+	char auth[256];
+	snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
+
+	struct curl_slist* headers = NULL;
+	headers = curl_slist_append(headers, auth);
+	headers = curl_slist_append(headers, "User-Agent: bluehats");
+
+	CURL* curl = curl_easy_init();
+	Buffer response = {malloc(1), 0};
+	curl_easy_setopt(curl, CURLOPT_URL, URL);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+	curl_easy_perform(curl);
+	curl_easy_cleanup(curl);
+
+	cJson* json = cJSON_Parse(response.data);
+	const char* sha = cJSON_GetObjectItem(json, "sha")->valuestring;
+	const char* content = cJSON_GetObjectItem(json, "content")->valuestring;
+	free(response.data);
+
+	char* indexString = base64_decode(content);
+	cJSON* index = cJSON_Parse(indexString);
+	free(indexString);
+
+	cJSON* versions = cJSON_GetObjectItem(index, name);
+	if (!versions) {
+		versions = cJSON_CreateArray();
+		cJSON_AddItemToObject(index, name, versions);
+	}
+	cJSON_AddItemToArray(versions, cJSON_CreateString(version));
+
+	char* updated = cJSON_Print(index);
+	char* encoded = base64_encode((unsigned char *)updated, strlen(updated));
+	free(updated);
+	cJSON_Delete(index);
+
+	char body[4096];
+	snprintf(body, sizeof(body), "{\"message\":\"publish %s@%s\",\"content\":\"%s\",\"sha\":\"%s\"}",
+		name, version, encoded, sha);
+	free(encoded);
+
+	curl = curl_easy_init();
+	response.data = malloc(1);
+	response.size = 0;
+	headers = curl_slist_append(NULL, auth);
+	headers = curl_slist_append(headers, "Content-Type: application/json");
+	headers = curl_slist_append(headers, "User-Agent: bluehats");
+
+	curl_easy_setopt(curl, CURLOPT_URL, URL);
+	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+	curl_easy_perform(curl);
+
+	free(response.data);
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+	cJSON_Delete(json);
 }
 
 void publish(const char* registry, const char* token) {
@@ -127,46 +257,10 @@ void publish(const char* registry, const char* token) {
 	snprintf(temporaryPath, sizeof(temporaryPath), "/tmp/%s-%s.tar.gz", name, version);
 	packTarball(".", temporaryPath);
 
-	char *checksum = sha256_file(temporaryPath);
-	printf("Checksum: %s\n", checksum);
+	char* uploadURL = createRelease(name, version, token);
+	uploadAsset(uploadURL, temporaryPath, name, version, token);
+	free(uploadURL);
 
-	char URL[256];
-	snprintf(URL, sizeof(URL), "%s/publish", registry);
-
-	char authHeader[128];
-	snprintf(authHeader, sizeof(authHeader), "Authorization: Token Bearer %s", token);
-
-	CURL* curl = curl_easy_init();
-	struct curl_slist* headers = curl_slist_append(NULL, authHeader);
-	
-	curl_mime* form = curl_mime_init(curl);
-	curl_mimepart* part = curl_mime_addpart(form);
-	curl_mime_name(part, "name");
-	curl_mime_data(part, name, CURL_ZERO_TERMINATED);
-
-	part = curl_mime_addpart(form);
-	curl_mime_name(part, "version");
-	curl_mime_data(part, version, CURL_ZERO_TERMINATED);
-
-	part = curl_mime_addpart(form);
-	curl_mime_name(part, "tarball");
-	curl_mime_filedata(part, temporaryPath);
-
-	Buffer response = {malloc(1), 0};
-	curl_easy_setopt(curl, CURLOPT_URL, URL);
-	curl_easy_setopt(curl, CURLOPT_MIMEPOST, form);
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-	curl_easy_perform(curl);
-
-	if (strstr(response.data, "\"ok\":true"))
-		printf("Published %s@%s successfully\n", name, version);
-	else
-		fprintf(stderr, "Publish failed: %s\n", response.data);
-	free(response.data);
-	free(checksum);
-	curl_mime_free(form);
-	curl_slist_free_all(headers);
-	curl_easy_cleanup(curl);
+	updateIndex(name, version, token);
+	printf("Done! %s@%s published successfully\n", name, version);
 }

@@ -55,12 +55,6 @@ int main(int argc, char** argv) {
 			return 1;
 		}
 		add(REGISTRY, argv[2]);
-	} else if (strcmp(argv[1], "publish") == 0) {
-		if (argc < 3) {
-			error("Usage: bluehats publish <token>", 1);
-			return 1;
-		}
-		publish(REGISTRY, argv[2]);
 	} else {
 		fprintf(stderr, "Unknown command: %s\n", argv[1]);
 		printUsage();
